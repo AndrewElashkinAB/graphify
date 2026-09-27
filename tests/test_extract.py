@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from graphify.build import build_from_json
+from graphify.build import build_from_json, edge_data
 from graphify.extract import extract_python, extract, collect_files, _make_id, extract_bash, extract_json, _DISPATCH
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -4552,6 +4552,84 @@ def test_inferred_uses_edge_dropped_for_module_top_level_reference(tmp_path):
     uses = _inferred_uses(result)
 
     assert not any(tgt == "helpers_helper" for _, tgt in uses)
+
+
+def _pair_edges(result, source, target):
+    """Every extracted edge from `source` to `target`, in emission order."""
+    return [
+        e for e in result["edges"]
+        if e.get("source") == source and e.get("target") == target
+    ]
+
+
+def _relations(edges, relation):
+    return [e for e in edges if e.get("relation") == relation]
+
+
+def test_inferred_uses_edge_does_not_suppress_a_decorated_callers_call(tmp_path):
+    """The INFERRED `uses` edge above lands on the same (function, class) pair as a
+    constructor call inside that function. It must not stop the call itself from
+    being recorded. The import-guided pass binds calls only in undecorated
+    top-level functions, so a decorated caller's call reaches the shared
+    cross-file pass, whose dedup ignored the relation: the `uses` edge pre-empted
+    the `calls` edge and the graph showed `uses` for a direct call. Whether a call
+    is recorded must not depend on a decorator for a directly imported class."""
+    (tmp_path / "helpers.py").write_text("class Helper:\n    pass\n", encoding="utf-8")
+    (tmp_path / "api.py").write_text(
+        "import functools\n"
+        "from helpers import Helper\n\n\n"
+        "def plain(req):\n    return Helper()\n\n\n"
+        "@functools.cache\n"
+        "def cached(req):\n    first = Helper()\n    return first, Helper()\n",
+        encoding="utf-8",
+    )
+
+    result = extract([tmp_path / "api.py", tmp_path / "helpers.py"], cache_root=tmp_path)
+    graph = build_from_json(result)
+
+    for caller in ("api_plain", "api_cached"):
+        edges = _pair_edges(result, caller, "helpers_helper")
+        calls = _relations(edges, "calls")
+        # One edge per pair: neither the second call in `cached` nor the shared
+        # pass re-seeing `plain`'s already-bound call adds a duplicate.
+        assert len(calls) == 1, (caller, edges)
+        # `from helpers import Helper` is explicit import evidence.
+        assert calls[0]["confidence"] == "EXTRACTED", (caller, edges)
+        # The `uses` fact is still recorded; it just no longer hides the call.
+        assert _relations(edges, "uses"), (caller, edges)
+        assert edge_data(graph, caller, "helpers_helper")["relation"] == "calls"
+
+    (cached_call,) = _relations(_pair_edges(result, "api_cached", "helpers_helper"), "calls")
+    assert cached_call["source_location"] == "L11"
+
+
+def test_inferred_uses_edge_does_not_suppress_a_name_resolved_call(tmp_path):
+    """Same collision without a decorator: a sys.path-style `from helpers import
+    Helper` whose module sits in a sibling directory is not resolvable from the
+    scan root, so the import-guided pass cannot bind the call, while the `uses`
+    resolver still binds the import by module stem. The shared pass resolves the
+    unique `Helper` by name; that call stays INFERRED but must be recorded."""
+    (tmp_path / "lib").mkdir()
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "lib" / "helpers.py").write_text("class Helper:\n    pass\n", encoding="utf-8")
+    (tmp_path / "scripts" / "api.py").write_text(
+        "from helpers import Helper\n\n\n"
+        "def handler(req):\n    return Helper()\n",
+        encoding="utf-8",
+    )
+
+    result = extract(
+        [tmp_path / "scripts" / "api.py", tmp_path / "lib" / "helpers.py"],
+        cache_root=tmp_path,
+    )
+    edges = _pair_edges(result, "scripts_api_handler", "lib_helpers_helper")
+    calls = _relations(edges, "calls")
+
+    assert _relations(edges, "uses"), edges
+    assert len(calls) == 1, edges
+    assert calls[0]["confidence"] == "INFERRED"
+    graph = build_from_json(result)
+    assert edge_data(graph, "scripts_api_handler", "lib_helpers_helper")["relation"] == "calls"
 
 
 def test_extract_declined_data_json_is_not_failed(tmp_path, capsys):
