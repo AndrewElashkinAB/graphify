@@ -3684,6 +3684,16 @@ def _extract_generic(
     # extensions don't (file stem is part of the id), so they're collected here
     # for a corpus-level merge after every file has been parsed.
     swift_extensions: list[dict] = []
+    # Python only: one entry per `class` statement, keyed by class nid; True when
+    # its base list is exactly one plain name. super() resolution in the call
+    # pass needs this syntactic view: attribute, subscript and call bases
+    # (`mixins.M`, `M[int]`, `make_base()`) emit no `inherits` edge, so counting
+    # edges would take `class C(mixins.M, Base)` for single inheritance.
+    py_class_single_base: dict[str, list[bool]] = {}
+    # Python only: local names bound by an import statement outside a function
+    # body. A class whose name an import also binds (`try: from fast import Base`
+    # / `except ImportError: class Base: ...`) may not be the class at runtime.
+    py_import_bound_names: set[str] = set()
     # #1356: call expressions in property/field initializers (e.g.
     # `let vm = VM()`) live outside function bodies, so the call-walk never
     # reaches them. Collect (owner_nid, call_node) here and walk them too.
@@ -3831,6 +3841,14 @@ def _extract_generic(
 
         # Import types
         if t in config.import_types:
+            if config.ts_module == "tree_sitter_python":
+                # `import a.b` binds `a`; `from m import x` binds `x`; an alias
+                # binds the alias. `from m import *` names nothing.
+                for imp in node.children_by_field_name("name"):
+                    bound = (imp.child_by_field_name("alias")
+                             if imp.type == "aliased_import" else imp)
+                    if bound is not None:
+                        py_import_bound_names.add(_read_text(bound, source).split(".")[0])
             if config.import_handler:
                 if config.ts_module == "tree_sitter_python":
                     imported_modules = config.import_handler(
@@ -3977,6 +3995,15 @@ def _extract_generic(
                             base = _read_text(arg, source)
                             base_nid = ensure_named_node(base, line)
                             add_edge(class_nid, base_nid, "inherits", line)
+                # Keyword arguments (`metaclass=M`, `**kw`) are not bases.
+                positional_bases = [
+                    a for a in (args.named_children if args else [])
+                    if a.type not in ("keyword_argument", "dictionary_splat", "comment")
+                ]
+                py_class_single_base.setdefault(class_nid, []).append(
+                    len(positional_bases) == 1
+                    and positional_bases[0].type == "identifier"
+                )
 
             # Swift-specific: conformance / inheritance
             if config.ts_module == "tree_sitter_swift":
@@ -5841,6 +5868,76 @@ def _extract_generic(
         if _e.get("relation") == "inherits":
             _local_bases.setdefault(_e["source"], []).append(_e["target"])
 
+    # Python call resolution must respect which names a call site can reach.
+    # label_to_nid keys a `.run()` method and a `run()` function alike and keeps
+    # the last definition in the file, so it cannot answer `super().run()` (the
+    # lookup starts at the enclosing class's base) or a bare `run()` (a bare name
+    # never reaches a class member). Inside a method named `run`, that map can
+    # return the method itself: a false recursive `calls` self-loop. A method is
+    # the target of its class's local `method` edge.
+    py_method_owner: dict[str, str] = {}
+    py_class_methods: dict[str, dict[str, str]] = {}
+    py_free_label_to_nid: dict[str, str] = {}
+    py_node_label: dict[str, str] = {}
+    if config.ts_module == "tree_sitter_python":
+        py_node_label = {n["id"]: str(n.get("label", "")) for n in nodes}
+        for _e in edges:
+            if _e.get("relation") != "method":
+                continue
+            _cls, _meth = _e.get("source"), _e.get("target")
+            if not _cls or not _meth:
+                continue
+            py_method_owner[_meth] = _cls
+            _mname = py_node_label.get(_meth, "").strip("()").lstrip(".")
+            if _mname:
+                py_class_methods.setdefault(_cls, {}).setdefault(_mname, _meth)
+        # Same construction as label_to_nid above, minus class members.
+        for n in nodes:
+            if n.get("type") == "namespace" or n["id"] in py_method_owner:
+                continue
+            _norm = n["label"].strip("()").lstrip(".")
+            if n["id"] not in scope_parents:
+                py_free_label_to_nid[_norm] = n["id"]
+            else:
+                py_free_label_to_nid.setdefault(_norm, n["id"])
+
+    def _py_super_target(caller: str, name: str, explicit_cls: str | None) -> str | None:
+        """Resolve ``super().name()`` called from method ``caller`` to the nearest
+        base-class method defined in THIS file.
+
+        Walks single inheritance only, read from each class's syntactic base
+        list: every class on the walk must be defined once in this file with
+        exactly one positional base, a plain name. Every base the walk reaches,
+        including the one that supplies ``name``, must also be bound once in the
+        file: one ``class`` statement and no import of the same name. Anything
+        else returns None and leaves the call unresolved rather than guessed (the
+        MRO is not modelled): multiple inheritance, including bases that emit no
+        ``inherits`` edge (``mixins.M``, ``M[int]``, ``make_base()``); a base
+        defined in another file; a base defined in both branches of an ``if``,
+        or as the ``except ImportError`` fallback for an import; an explicit
+        ``super(X, self)`` whose X is not the enclosing class; a cycle; or no
+        match.
+        """
+        cls = py_method_owner.get(caller)
+        if not cls:
+            return None
+        if explicit_cls is not None and explicit_cls != py_node_label.get(cls):
+            return None
+        seen = {cls}
+        while py_class_single_base.get(cls) == [True]:
+            bases = _local_bases.get(cls, [])
+            if len(bases) != 1 or bases[0] in seen:
+                return None
+            cls = bases[0]
+            if (len(py_class_single_base.get(cls, ())) != 1
+                    or py_node_label.get(cls) in py_import_bound_names):
+                return None
+            seen.add(cls)
+            hit = py_class_methods.get(cls, {}).get(name)
+            if hit:
+                return hit
+        return None
+
     def _fields_up_chain(tables: dict, class_nid) -> dict:
         if not class_nid:
             return {}
@@ -6096,6 +6193,9 @@ def _extract_generic(
             is_this_field_call: bool = False
             swift_receiver: str | None = None
             member_receiver: str | None = None
+            # Python ``super(X, self)``: the text of X ("" when X is not a plain
+            # name); None for the zero-argument ``super()`` form.
+            py_super_first_arg: str | None = None
             kotlin_qualified_prefix: str | None = None
             kotlin_object_receiver: str | None = None
             csharp_qualified_prefix: str | None = None
@@ -6474,6 +6574,17 @@ def _extract_generic(
                                     and _read_text(receiver_func, source) == "super"
                                 ):
                                     member_receiver = "super"
+                                    super_args = obj.child_by_field_name("arguments")
+                                    first_arg = next(
+                                        (c for c in super_args.named_children
+                                         if c.type != "comment"),
+                                        None,
+                                    ) if super_args is not None else None
+                                    if first_arg is not None:
+                                        py_super_first_arg = (
+                                            _read_text(first_arg, source)
+                                            if first_arg.type == "identifier" else ""
+                                        )
                             elif (obj is not None
                                   and obj.type in config.call_accessor_node_types
                                   and config.call_accessor_object_field):
@@ -6551,7 +6662,20 @@ def _extract_generic(
                                 break
                             curr_scope = scope_parents.get(curr_scope)
                         if not tgt_nid:
-                            tgt_nid = label_to_nid.get(callee_name)
+                            # A bare name never reaches a class member in Python
+                            # (a class body is not an enclosing scope for its
+                            # methods), so skip methods here: `digest(x)` inside
+                            # `def digest(self)` must not bind to itself.
+                            tgt_nid = py_free_label_to_nid.get(callee_name)
+                    elif (
+                        config.ts_module == "tree_sitter_python"
+                        and member_receiver == "super"
+                    ):
+                        # super().m() looks m up starting at the enclosing class's
+                        # base. The file-wide bare-name map returns whichever `m`
+                        # is defined last in the file (often the caller itself or
+                        # a sibling class's `m`), so it must not answer this.
+                        tgt_nid = _py_super_target(caller_nid, callee_name, py_super_first_arg)
                     else:
                         tgt_nid = label_to_nid.get(callee_name)
                     # A qualified `new A.B.Foo()` whose bare name matches only a
