@@ -6564,14 +6564,20 @@ def _extract_generic(
                         and not nid_to_sf.get(tgt_nid)
                     ):
                         tgt_nid = None
-                # A name-only reference can leave a source-less stub behind when
-                # the target is outside the scanned corpus (for example,
-                # ``HTTPException`` imported from FastAPI). It is useful for the
-                # type/reference edge, but it is not a project-defined callable
-                # and must not become a calls hub. Real definitions have a
-                # source_file and continue through the normal call path.
-                external_stub_target = bool(tgt_nid and not nid_to_sf.get(tgt_nid))
-                if tgt_nid and not external_stub_target:
+                # A bare name that finds only a source-less stub in this file
+                # names something defined elsewhere: a class from another project
+                # file that this file uses as a type (annotation, base class), or
+                # an external name such as ``HTTPException`` imported from
+                # FastAPI. This file cannot tell the two apart, so the call is
+                # left unresolved and deferred to cross-file resolution, as the
+                # C# qualified case above is. That pass resolves it exactly as it
+                # would with no type use in the file, and never binds a
+                # source-less target, so the stub cannot become a calls hub
+                # (#3156). Dropping the call here instead lost calls to project
+                # classes: having bound to the stub, they never reached raw_calls.
+                if tgt_nid and not nid_to_sf.get(tgt_nid):
+                    tgt_nid = None
+                if tgt_nid:
                     pair = (caller_nid, tgt_nid)
                     if pair not in seen_call_pairs:
                         seen_call_pairs.add(pair)
