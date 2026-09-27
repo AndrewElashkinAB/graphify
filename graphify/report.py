@@ -299,8 +299,15 @@ def generate(
     if ambiguous:
         lines += ["", "## Ambiguous Edges - Review These"]
         for u, v, d in ambiguous:
-            ul = G.nodes[u].get("label", u)
-            vl = G.nodes[v].get("label", v)
+            # An undirected graph yields (u, v) in node-insertion order, not
+            # source -> target; build.py keeps the true endpoints in _src/_tgt
+            # (#563). Trust them only when they name this edge's own endpoints,
+            # else fall back to (u, v), as the query output does (#2080).
+            src, tgt = d.get("_src", u), d.get("_tgt", v)
+            if {src, tgt} != {u, v}:
+                src, tgt = u, v
+            ul = G.nodes[src].get("label", src)
+            vl = G.nodes[tgt].get("label", tgt)
             lines += [
                 f"- `{ul}` → `{vl}`  [AMBIGUOUS]",
                 f"  {d.get('source_file', '')} · relation: {d.get('relation', 'unknown')}",

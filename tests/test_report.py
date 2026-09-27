@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import networkx as nx
 from graphify.build import build_from_json
 from graphify.cluster import cluster, score_all
 from graphify.analyze import god_nodes, surprising_connections
@@ -201,3 +202,54 @@ def test_report_hubs_use_wikilinks_when_obsidian():
     labels = {cid: f"Widget {cid}" for cid in communities}
     report = generate(G, communities, cohesion, labels, gods, surprises, detection, tokens, "./project", min_community_size=1, obsidian=True)
     assert "[[_COMMUNITY_" in report
+
+
+# --- Ambiguous Edges direction --------------------------------------------------
+
+def _single_community_report(G):
+    communities = {0: list(G.nodes)}
+    detection = {"total_files": 2, "total_words": 10, "needs_graph": True, "warning": None}
+    return generate(G, communities, {0: 1.0}, {0: "Community 0"}, [], [],
+                    detection, {"input": 0, "output": 0}, "./project")
+
+
+def test_ambiguous_edges_print_true_direction_not_storage_order():
+    """An undirected nx.Graph yields each edge from whichever endpoint was
+    inserted first, not source -> target. build.py keeps the true endpoints in
+    _src/_tgt (#563), which to_json, the HTML export, surprising_connections and
+    the query output already honour. With the callee inserted before the
+    caller, the Ambiguous Edges section printed the callee as the caller."""
+    extraction = {
+        "nodes": [
+            {"id": "widget_refresh", "label": "Widget.refresh()", "file_type": "code",
+             "source_file": "app/models.py"},
+            {"id": "render_dashboard", "label": "render_dashboard()", "file_type": "code",
+             "source_file": "app/views.py"},
+        ],
+        "edges": [
+            {"source": "render_dashboard", "target": "widget_refresh", "relation": "calls",
+             "confidence": "AMBIGUOUS", "source_file": "app/views.py", "weight": 1.0},
+        ],
+    }
+    G = build_from_json(extraction)
+    # Precondition: storage order is callee-first, the case that used to flip.
+    assert list(G.edges()) == [("widget_refresh", "render_dashboard")]
+    report = _single_community_report(G)
+    assert "- `render_dashboard()` → `Widget.refresh()`  [AMBIGUOUS]" in report
+    assert "`Widget.refresh()` → `render_dashboard()`" not in report
+
+
+def test_ambiguous_edges_fall_back_to_storage_order_on_stale_markers():
+    """A marker that does not name the edge's own endpoints (a graph mutated
+    after build, e.g. a node merged away, #226) and a missing marker must
+    neither crash the report nor print a node the edge does not touch: both
+    fall back to storage order, like the query output's guard (#2080)."""
+    G = nx.Graph()
+    for nid, label in (("a", "Alpha"), ("b", "Beta"), ("c", "Gamma"), ("d", "Delta")):
+        G.add_node(nid, label=label, source_file="notes.md")
+    G.add_edge("a", "b", relation="uses", confidence="AMBIGUOUS", source_file="notes.md",
+               _src="merged_away", _tgt="a")
+    G.add_edge("c", "d", relation="uses", confidence="AMBIGUOUS", source_file="notes.md")
+    report = _single_community_report(G)
+    assert "- `Alpha` → `Beta`  [AMBIGUOUS]" in report
+    assert "- `Gamma` → `Delta`  [AMBIGUOUS]" in report
