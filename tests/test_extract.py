@@ -2060,6 +2060,254 @@ def test_python_known_member_receivers_keep_local_call_edges(tmp_path):
     ), f"unresolved factory() receiver must not bind by bare name: {call_pairs}"
 
 
+def _qualified_call_pairs(result):
+    """`calls` edges as ('Class.method' | 'func', same) name pairs."""
+    nodes = {node["id"]: node for node in result["nodes"]}
+    owner = {e["target"]: e["source"] for e in result["edges"] if e.get("relation") == "method"}
+
+    def name(nid):
+        bare = nodes[nid]["label"].strip("()").lstrip(".")
+        return f"{nodes[owner[nid]]['label']}.{bare}" if nid in owner else bare
+
+    return {
+        (name(e["source"]), name(e["target"]))
+        for e in result["edges"]
+        if e.get("relation") == "calls"
+    }
+
+
+def test_python_super_call_binds_to_base_method_not_caller(tmp_path):
+    """`super().m()` inside a method named `m` must bind to the base class's `m`,
+    never to the calling method (a false self-loop) or a sibling class's `m`.
+    Genuine recursion keeps its self-edge."""
+    fixture = tmp_path / "models.py"
+    fixture.write_text(
+        "class Base:\n"
+        "    def run(self):\n"
+        "        return 1\n\n"
+        "    @classmethod\n"
+        "    def create(cls):\n"
+        "        return cls()\n\n"
+        "class Child(Base):\n"
+        "    def run(self):\n"
+        "        return super().run() + 1\n\n"
+        "    @classmethod\n"
+        "    def create(cls):\n"
+        "        return super().create()\n\n"
+        "class Shape:\n"
+        "    def __init__(self, name):\n"
+        "        self.name = name\n\n"
+        "class Circle(Shape):\n"
+        "    def __init__(self, r):\n"
+        "        super().__init__('circle')\n\n"
+        "class Square(Shape):\n"
+        "    def __init__(self, s):\n"
+        "        super(Square, self).__init__('square')\n\n"
+        "class Tree:\n"
+        "    def depth(self, n):\n"
+        "        return 0 if n == 0 else 1 + self.depth(n - 1)\n\n"
+        "def factorial(n):\n"
+        "    return 1 if n < 2 else n * factorial(n - 1)\n",
+        encoding="utf-8",
+    )
+    pairs = _qualified_call_pairs(extract([fixture], cache_root=tmp_path, root=tmp_path))
+
+    assert ("Child.run", "Base.run") in pairs, pairs
+    assert ("Child.create", "Base.create") in pairs, pairs
+    assert ("Circle.__init__", "Shape.__init__") in pairs, pairs
+    assert ("Square.__init__", "Shape.__init__") in pairs, pairs
+    assert ("Circle.__init__", "Square.__init__") not in pairs, pairs
+    for caller in ("Child.run", "Child.create", "Circle.__init__", "Square.__init__"):
+        assert (caller, caller) not in pairs, f"false self-loop on {caller}: {pairs}"
+    # Genuine recursion is unaffected.
+    assert ("Tree.depth", "Tree.depth") in pairs, pairs
+    assert ("factorial", "factorial") in pairs, pairs
+
+
+def test_python_super_call_with_unresolvable_base_never_binds_to_caller(tmp_path):
+    """When the base is in another file, the class uses multiple inheritance (MRO
+    not modelled), or `super(X, self)` names a class other than the enclosing one,
+    `super().m()` stays unresolved instead of binding to the caller itself."""
+    (tmp_path / "base.py").write_text(
+        "class Engine:\n    def start(self):\n        return 1\n", encoding="utf-8",
+    )
+    turbo = tmp_path / "turbo.py"
+    turbo.write_text(
+        "from base import Engine\n\n"
+        "class A:\n"
+        "    def ping(self):\n"
+        "        return 1\n\n"
+        "class B:\n"
+        "    def ping(self):\n"
+        "        return 2\n\n"
+        "class C(A, B):\n"
+        "    def ping(self):\n"
+        "        return super().ping()\n\n"
+        "class TurboEngine(Engine):\n"
+        "    def start(self):\n"
+        "        return super().start() + 1\n\n"
+        "class P:\n"
+        "    def save(self):\n"
+        "        return 1\n\n"
+        "class Q(P):\n"
+        "    def save(self):\n"
+        "        return 2\n\n"
+        "class R(Q):\n"
+        "    def save(self):\n"
+        "        return super(Q, self).save()\n",
+        encoding="utf-8",
+    )
+    pairs = _qualified_call_pairs(
+        extract([tmp_path / "base.py", turbo], cache_root=tmp_path, root=tmp_path)
+    )
+
+    for caller in ("C.ping", "TurboEngine.start", "R.save"):
+        assert (caller, caller) not in pairs, f"false self-loop on {caller}: {pairs}"
+    assert not any(src == "C.ping" for src, _ in pairs), pairs
+    # super(Q, self) skips Q: binding to Q.save would be wrong.
+    assert ("R.save", "Q.save") not in pairs, pairs
+
+
+def test_python_super_call_with_non_name_base_is_not_single_inheritance(tmp_path):
+    """Attribute, subscript and call bases emit no `inherits` edge but are still
+    bases: in `class C(mixins.Loggable, Base)` the MRO reaches `Loggable.run`
+    before `Base.run`. Single inheritance is read from the class's syntactic base
+    list, so these stay unresolved instead of binding to `Base.run`. A keyword
+    argument such as `metaclass=` is not a base."""
+    fixture = tmp_path / "mixed.py"
+    fixture.write_text(
+        "import mixins\n\n"
+        "class Base:\n"
+        "    def run(self):\n"
+        "        return 1\n\n"
+        "class Loggable:\n"
+        "    def __class_getitem__(cls, item):\n"
+        "        return cls\n\n"
+        "    def run(self):\n"
+        "        return 2\n\n"
+        "def make_base():\n"
+        "    return Loggable\n\n"
+        "class ViaAttribute(mixins.Loggable, Base):\n"
+        "    def run(self):\n"
+        "        return super().run()\n\n"
+        "class ViaSubscript(Loggable[int], Base):\n"
+        "    def run(self):\n"
+        "        return super().run()\n\n"
+        "class ViaCall(make_base(), Base):\n"
+        "    def run(self):\n"
+        "        return super().run()\n\n"
+        "class Mid(mixins.Loggable, Base):\n"
+        "    pass\n\n"
+        "class Leaf(Mid):\n"
+        "    def run(self):\n"
+        "        return super().run()\n\n"
+        "class Meta(type):\n"
+        "    pass\n\n"
+        "class Keyed(Base, metaclass=Meta):\n"
+        "    def run(self):\n"
+        "        return super().run()\n",
+        encoding="utf-8",
+    )
+    pairs = _qualified_call_pairs(extract([fixture], cache_root=tmp_path, root=tmp_path))
+
+    for caller in ("ViaAttribute.run", "ViaSubscript.run", "ViaCall.run", "Leaf.run"):
+        assert not any(src == caller for src, _ in pairs), f"{caller} guessed: {pairs}"
+    assert ("Keyed.run", "Base.run") in pairs, pairs
+
+
+@pytest.mark.parametrize("source, control", [
+    pytest.param(
+        "import os\n\n"
+        "class A:\n"
+        "    def run(self):\n"
+        "        return 1\n\n"
+        "if os.name == 'nt':\n"
+        "    class Base(A):\n"
+        "        pass\n"
+        "else:\n"
+        "    class Base:\n"
+        "        def run(self):\n"
+        "            return 2\n\n"
+        "class Child(Base):\n"
+        "    def run(self):\n"
+        "        return super().run()\n\n"
+        "class Plain(A):\n"
+        "    def run(self):\n"
+        "        return super().run()\n",
+        ("Plain.run", "A.run"),
+        id="defined-in-if-and-else",
+    ),
+    pytest.param(
+        "try:\n"
+        "    from fast import Base\n"
+        "except ImportError:\n"
+        "    class Base:\n"
+        "        def run(self):\n"
+        "            return 1\n\n"
+        "class Child(Base):\n"
+        "    def run(self):\n"
+        "        return super().run()\n\n"
+        "class Local:\n"
+        "    def run(self):\n"
+        "        return 2\n\n"
+        "class Sub(Local):\n"
+        "    def run(self):\n"
+        "        return super().run()\n",
+        ("Sub.run", "Local.run"),
+        id="importerror-fallback",
+    ),
+])
+def test_python_super_call_to_base_bound_more_than_once_stays_unresolved(
+    tmp_path, source, control,
+):
+    """The class that supplies `m` to `super().m()` must be bound once in the file:
+    one `class` statement and no import of the same name. A base defined in both
+    branches of an `if`, or a local class that is only the `except ImportError`
+    fallback for an imported name, may not be the base at runtime, so the call
+    stays unresolved instead of binding to the local definition. A base bound
+    once in the same file still resolves."""
+    fixture = tmp_path / "rebound.py"
+    fixture.write_text(source, encoding="utf-8")
+    pairs = _qualified_call_pairs(extract([fixture], cache_root=tmp_path, root=tmp_path))
+
+    assert not any(src == "Child.run" for src, _ in pairs), pairs
+    assert control in pairs, pairs
+
+
+def test_python_bare_call_never_binds_to_same_named_method(tmp_path):
+    """A bare `digest(x)` inside `def digest(self)` names the module-level (or
+    imported) function, never the method: Python does not put class members in
+    scope for a bare name."""
+    (tmp_path / "hashing.py").write_text(
+        "def checksum(x):\n    return hash(x)\n", encoding="utf-8",
+    )
+    local = tmp_path / "local.py"
+    local.write_text(
+        "def digest(x):\n"
+        "    return hash(x)\n\n"
+        "class Widget:\n"
+        "    def digest(self):\n"
+        "        return digest(self)\n",
+        encoding="utf-8",
+    )
+    imported = tmp_path / "imported.py"
+    imported.write_text(
+        "from hashing import checksum\n\n"
+        "class Gadget:\n"
+        "    def checksum(self):\n"
+        "        return checksum(self)\n",
+        encoding="utf-8",
+    )
+    pairs = _qualified_call_pairs(extract(
+        [tmp_path / "hashing.py", local, imported], cache_root=tmp_path, root=tmp_path,
+    ))
+
+    assert ("Widget.digest", "digest") in pairs, pairs
+    assert ("Widget.digest", "Widget.digest") not in pairs, pairs
+    assert ("Gadget.checksum", "Gadget.checksum") not in pairs, pairs
+    assert ("Gadget.checksum", "checksum") in pairs, pairs
+
+
 def test_python_unresolved_receiver_never_crosses_modules(tmp_path):
     """#2417 cross-file guard: `client.fetch('x')` must not bind to `util.fetch`
     just because the caller's file imports that name — the receiver `client`
