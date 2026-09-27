@@ -71,6 +71,7 @@ from graphify.extractors.vbnet import extract_vbnet, resolve_vbnet_partial_calls
 from graphify.extractors.zig import extract_zig  # noqa: F401
 from graphify.security import sanitize_metadata
 from graphify.paths import disambiguate_ambiguous_candidates
+from graphify.build import _GENERIC_RELATIONS
 
 from graphify.extractors.models import LanguageConfig, _JS_CACHE_BYPASS_SUFFIXES, _NamespaceExportFact, _StarExportFact, _SymbolAliasFact, _SymbolDeclarationFact, _SymbolExportFact, _SymbolImportFact, _SymbolResolutionFacts, _SymbolUseFact, _WORKSPACE_PACKAGE_CACHE  # noqa: E402,F401
 
@@ -8218,6 +8219,14 @@ def extract(
         nid_to_file_nid[n["id"]] = _file_node_id(sf_rel)
 
     existing_pairs = {(e["source"], e["target"]) for e in all_edges}
+    # Pairs that pre-empt a direct `calls` edge below. A generic edge on the pair
+    # (the Python import resolver's INFERRED `uses`, #2652) says only that the two
+    # symbols appear together, so it must not stop the call itself from being
+    # recorded; build_from_json keeps the specific relation when both arrive (#2803).
+    specific_pairs = {
+        (e["source"], e["target"]) for e in all_edges
+        if e.get("relation") not in _GENERIC_RELATIONS
+    }
     # Call-like pairs only, for the indirect_call dedup: an `imports` edge from a
     # file to the symbol it imports is EXPECTED and must not suppress an
     # indirect_call to that same symbol (JS/TS named imports create such an edge).
@@ -8418,7 +8427,8 @@ def extract(
         # (INFERRED, callable-target-gated) and independent of import evidence.
         if not has_import_evidence and str(rc.get("source_file", "")).endswith(_JS_TS_CALL_SUFFIXES):
             continue
-        if tgt != caller and (caller, tgt) not in existing_pairs:
+        if tgt != caller and (caller, tgt) not in specific_pairs:
+            specific_pairs.add((caller, tgt))
             existing_pairs.add((caller, tgt))
             # Promote to EXTRACTED when there's a direct import edge from the
             # caller's file pointing at either the callee symbol itself or the
